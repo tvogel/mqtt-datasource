@@ -10,9 +10,10 @@ import (
 
 // Mock client that implements our Client interface directly
 type mockClient struct {
-	topics        TopicMap
-	subscriptions map[string]bool
-	connected     bool
+	topics         TopicMap
+	subscriptions  map[string]bool
+	connected      bool
+	latestMessages map[string]map[string]Message
 }
 
 func (m *mockClient) GetTopic(reqPath string) (*Topic, bool) {
@@ -47,7 +48,8 @@ func (m *mockClient) Subscribe(reqPath string, logger log.Logger) (*Topic, error
 	}
 
 	// Mirror the real client: only register the MQTT subscription once per mqttPath.
-	if !m.topics.HasSubscription(mqttPath) {
+	alreadySubscribed := m.topics.HasSubscription(mqttPath)
+	if !alreadySubscribed {
 		if m.subscriptions == nil {
 			m.subscriptions = make(map[string]bool)
 		}
@@ -56,6 +58,13 @@ func (m *mockClient) Subscribe(reqPath string, logger log.Logger) (*Topic, error
 
 	// Store with reqPath as key
 	m.topics.Map.Store(reqPath, t)
+	if messages := m.latestMessages[mqttPath]; len(messages) > 0 {
+		latest := make([]Message, 0, len(messages))
+		for _, message := range messages {
+			latest = append(latest, message)
+		}
+		t.SeedMessages(latest)
+	}
 	return t, nil
 }
 
@@ -74,7 +83,15 @@ func (m *mockClient) HandleMessage(topicPath string, payload []byte) {
 	message := Message{
 		Timestamp: time.Now(),
 		Value:     payload,
+		Topic:     topicPath,
 	}
+	if m.latestMessages == nil {
+		m.latestMessages = make(map[string]map[string]Message)
+	}
+	if m.latestMessages[topicPath] == nil {
+		m.latestMessages[topicPath] = make(map[string]Message)
+	}
+	m.latestMessages[topicPath][topicPath] = message
 	m.topics.AddMessage(topicPath, message)
 }
 
@@ -83,6 +100,29 @@ func newMockClient() *mockClient {
 		topics:        TopicMap{},
 		subscriptions: make(map[string]bool),
 		connected:     true,
+	}
+}
+
+func TestClient_LatestMessagesForKeepsNewestMessagePerTopic(t *testing.T) {
+	c := &client{}
+	c.HandleMessage("encoded/wildcard", "sensor/temp", []byte("20"))
+	c.HandleMessage("encoded/wildcard", "sensor/humidity", []byte("40"))
+	c.HandleMessage("encoded/wildcard", "sensor/temp", []byte("21"))
+
+	messages := c.latestMessagesFor("encoded/wildcard")
+	if len(messages) != 2 {
+		t.Fatalf("Expected one latest message per actual topic, got %d", len(messages))
+	}
+
+	latestByTopic := make(map[string]string, len(messages))
+	for _, message := range messages {
+		latestByTopic[message.Topic] = string(message.Value)
+	}
+	if latestByTopic["sensor/temp"] != "21" {
+		t.Errorf("Expected newest temperature payload 21, got %q", latestByTopic["sensor/temp"])
+	}
+	if latestByTopic["sensor/humidity"] != "40" {
+		t.Errorf("Expected humidity payload 40, got %q", latestByTopic["sensor/humidity"])
 	}
 }
 
@@ -241,6 +281,36 @@ func TestClient_Subscribe_MultipleStreamingKeys(t *testing.T) {
 
 	if storedTopic1 == storedTopic2 || storedTopic1 == storedTopic3 || storedTopic2 == storedTopic3 {
 		t.Error("Expected retrieved topics to be different instances")
+	}
+}
+
+func TestClient_Subscribe_SeedsLatestMessageForNewStream(t *testing.T) {
+	c := newMockClient()
+
+	firstReqPath := "1s/dGVzdC90b3BpYw/datasource/hash/org/A"
+	secondReqPath := "1s/dGVzdC90b3BpYw/datasource/hash/org/B"
+
+	_, err := c.Subscribe(firstReqPath, log.DefaultLogger)
+	if err != nil {
+		t.Fatalf("First subscribe failed: %v", err)
+	}
+
+	retainedMessage := []byte(`{"value":2.1,"raw_value":21}`)
+	c.HandleMessage("dGVzdC90b3BpYw", retainedMessage)
+	if err := c.Unsubscribe(firstReqPath, log.DefaultLogger); err != nil {
+		t.Fatalf("First stream unsubscribe failed: %v", err)
+	}
+
+	secondTopic, err := c.Subscribe(secondReqPath, log.DefaultLogger)
+	if err != nil {
+		t.Fatalf("Second subscribe failed: %v", err)
+	}
+
+	if len(secondTopic.Messages) != 1 {
+		t.Fatalf("Expected the latest retained value to seed the new stream, got %d messages", len(secondTopic.Messages))
+	}
+	if string(secondTopic.Messages[0].Value) != string(retainedMessage) {
+		t.Errorf("Expected seeded payload %s, got %s", retainedMessage, secondTopic.Messages[0].Value)
 	}
 }
 

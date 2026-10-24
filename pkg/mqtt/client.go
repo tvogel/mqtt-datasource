@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+	"sync"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
@@ -34,8 +35,10 @@ type Options struct {
 }
 
 type client struct {
-	client paho.Client
-	topics TopicMap
+	client         paho.Client
+	topics         TopicMap
+	latestMu       sync.RWMutex
+	latestMessages map[string]map[string]Message
 }
 
 func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstanceSettings) (Client, error) {
@@ -103,7 +106,8 @@ func NewClient(ctx context.Context, o Options, settings backend.DataSourceInstan
 	}
 
 	return &client{
-		client: pahoClient,
+		client:         pahoClient,
+		latestMessages: make(map[string]map[string]Message),
 	}, nil
 }
 
@@ -114,11 +118,32 @@ func (c *client) IsConnected() bool {
 func (c *client) HandleMessage(fanOutKey string, actualTopic string, payload []byte) {
 	message := Message{
 		Timestamp: time.Now(),
-		Value:     payload,
+		Value:     append([]byte(nil), payload...),
 		Topic:     actualTopic,
 	}
+	c.latestMu.Lock()
+	if c.latestMessages == nil {
+		c.latestMessages = make(map[string]map[string]Message)
+	}
+	if c.latestMessages[fanOutKey] == nil {
+		c.latestMessages[fanOutKey] = make(map[string]Message)
+	}
+	c.latestMessages[fanOutKey][actualTopic] = message
+	c.latestMu.Unlock()
 
 	c.topics.AddMessage(fanOutKey, message)
+}
+
+func (c *client) latestMessagesFor(fanOutKey string) []Message {
+	c.latestMu.RLock()
+	defer c.latestMu.RUnlock()
+
+	byTopic := c.latestMessages[fanOutKey]
+	messages := make([]Message, 0, len(byTopic))
+	for _, message := range byTopic {
+		messages = append(messages, message)
+	}
+	return messages
 }
 
 func (c *client) GetTopic(reqPath string) (*Topic, bool) {
@@ -169,6 +194,7 @@ func (c *client) Subscribe(reqPath string, logger log.Logger) (*Topic, error) {
 	// can find it in the map when the broker delivers a retained message
 	// immediately upon subscription (before token.Wait() returns).
 	c.topics.Map.Store(reqPath, t)
+	t.SeedMessages(c.latestMessagesFor(mqttPath))
 
 	// Only register the MQTT subscription once per real MQTT topic.
 	// If another Topic entry with the same mqttPath already exists, the MQTT broker

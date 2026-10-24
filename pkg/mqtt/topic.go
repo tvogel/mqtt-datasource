@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"bytes"
 	"encoding/base64"
 	"path"
 	"slices"
@@ -54,6 +55,24 @@ func (t *Topic) AppendMessage(message Message) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.Messages = append(t.Messages, message)
+}
+
+func (t *Topic) SeedMessages(messages []Message) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for _, message := range messages {
+		found := false
+		for _, existing := range t.Messages {
+			if existing.Topic == message.Topic && existing.Timestamp.Equal(message.Timestamp) && bytes.Equal(existing.Value, message.Value) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Messages = append(t.Messages, message)
+		}
+	}
 }
 
 // KeepLastMessage keeps only the last message per unique MQTT topic in the
