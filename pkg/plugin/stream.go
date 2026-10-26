@@ -41,32 +41,42 @@ func (ds *MQTTDatasource) RunStream(ctx context.Context, req *backend.RunStreamR
 		}
 	}()
 
+	sendFrame := func(skipEmpty bool) {
+		topic, ok := ds.Client.GetTopic(topicKey)
+		if !ok {
+			logger.Debug("topic not found", "path", req.Path, "topicKey", topicKey)
+			return
+		}
+		frame, err := topic.ToDataFrame(logger)
+		if err != nil {
+			logger.Error("failed to convert topic to data frame", "path", req.Path, "error", backend.DownstreamError(err))
+			return
+		}
+		if skipEmpty && frame.Rows() == 0 {
+			return
+		}
+		frame.Name = refID
+		frame = frame.SetRefID(refID)
+		topic.KeepLastMessage()
+		if err := sender.SendFrame(frame, data.IncludeAll); err != nil {
+			logger.Error("failed to send data frame", "path", req.Path, "error", backend.DownstreamError(err))
+		}
+	}
+
+	// Push retained/latest messages seeded by Subscribe right away instead of
+	// waiting a full interval for the first frame.
+	sendFrame(true)
+
 	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Debug("stopped streaming (context canceled)", "path", req.Path, "topicKey", topicKey)
-			ticker.Stop()
 			return nil
 		case <-ticker.C:
-			topic, ok := ds.Client.GetTopic(topicKey)
-			if !ok {
-				logger.Debug("topic not found", "path", req.Path, "topicKey", topicKey)
-				break
-			}
-			frame, err := topic.ToDataFrame(logger)
-			if err != nil {
-				logger.Error("failed to convert topic to data frame", "path", req.Path, "error", backend.DownstreamError(err))
-				break
-			}
-			frame.Name = refID
-			frame = frame.SetRefID(refID)
-			topic.KeepLastMessage()
-			if err := sender.SendFrame(frame, data.IncludeAll); err != nil {
-				logger.Error("failed to send data frame", "path", req.Path, "error", backend.DownstreamError(err))
-			}
-
+			sendFrame(false)
 		}
 	}
 }
